@@ -15,12 +15,18 @@ LOGGER = logging.getLogger(__name__)
 class PARNet(torch.nn.Module):
     """PARModel ANN model."""
 
-    def __init__(self, data_size, context_size, hidden_size=32):
+    def __init__(self, data_size, context_size, hidden_size=32, rnn="GRU"):
         super(PARNet, self).__init__()
         self.context_size = context_size
         self.down = torch.nn.Linear(data_size + context_size, hidden_size)
-        self.rnn = torch.nn.GRU(hidden_size, hidden_size)
         self.up = torch.nn.Linear(hidden_size, data_size)
+
+        if rnn == "GRU":
+            self.rnn = torch.nn.GRU(hidden_size, hidden_size)
+        elif rnn == "LSTM":
+            self.rnn = torch.nn.LSTM(hidden_size, hidden_size)
+        else:
+            raise ValueError("Unsupported RNN type. Please use 'GRU' or 'LSTM'.")
 
     def forward(self, x, c):
         """Forward passing computation."""
@@ -98,7 +104,7 @@ class PARModel(DeepEcho):
             Whether to print progress to console or not.
     """
 
-    def __init__(self, epochs=128, sample_size=1, cuda=True, verbose=True):
+    def __init__(self, epochs=128, sample_size=1, cuda=True, verbose=True, hidden_size=32, rnn="GRU"):
         self.epochs = epochs
         self.sample_size = sample_size
 
@@ -111,6 +117,8 @@ class PARModel(DeepEcho):
 
         self.device = torch.device(device)
         self.verbose = verbose
+        self.hidden_size = hidden_size
+        self.rnn = rnn
         self.loss_values = pd.DataFrame(columns=['Epoch', 'Loss'])
 
         LOGGER.info('%s instance created', self)
@@ -331,7 +339,7 @@ class PARModel(DeepEcho):
         if self._ctx_dims:
             C = torch.stack(C, dim=0).to(self.device)
 
-        self._model = PARNet(self._data_dims, self._ctx_dims).to(self.device)
+        self._model = PARNet(self._data_dims, self._ctx_dims, self.hidden_size, self.rnn).to(self.device)
         optimizer = torch.optim.Adam(self._model.parameters(), lr=1e-3)
 
         iterator = tqdm(range(self.epochs), disable=(not self.verbose))
