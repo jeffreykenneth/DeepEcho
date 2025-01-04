@@ -120,6 +120,7 @@ class PARModel(DeepEcho):
         self.hidden_size = hidden_size
         self.rnn = rnn
         self.loss_values = pd.DataFrame(columns=['Epoch', 'Loss'])
+        self.transition_matrices = dict()
 
         LOGGER.info('%s instance created', self)
 
@@ -154,7 +155,7 @@ class PARModel(DeepEcho):
                 }
                 idx += 3
 
-            elif t == 'categorical' or t == 'ordinal':
+            elif t == 'categorical' or t == 'ordinal' or t == 'markov':
                 idx_map[i] = {'type': t, 'indices': {}}
                 idx += 1
                 for v in set(x[i]):
@@ -202,6 +203,33 @@ class PARModel(DeepEcho):
         }
         self._data_dims += 3
 
+        for key, val in self._data_map.items():
+            if val['type'] == 'markov':
+                # generate transition matrix
+                n_events = len(val["indices"])
+                start_index = min(val["indices"].values())
+                transition_matrix = np.zeros((n_events, n_events))
+
+                for sequence in sequences:
+                    curr_sequence = sequence["data"][key]
+
+                    for i in range(1, len(curr_sequence)):
+                        prev_event = curr_sequence[i-1]
+                        prev_event_index = val["indices"][prev_event] - start_index
+
+                        curr_event = curr_sequence[i]
+                        curr_event_index = val["indices"][curr_event] - start_index
+
+                        transition_matrix[prev_event_index][curr_event_index] += 1
+
+                transition_matrix += 1 # Smoothing
+                row_sums = transition_matrix.sum(axis=1, keepdims=True)
+
+                transition_matrix = torch.from_numpy(transition_matrix / row_sums)
+                transition_matrix = transition_matrix.to(self.device)
+
+                self.transition_matrices[key] = transition_matrix
+
     def _data_to_tensor(self, data):
         seq_len = len(data[0])
         X = []
@@ -239,6 +267,7 @@ class PARModel(DeepEcho):
                 elif props['type'] in [
                     'categorical',
                     'ordinal',
+                    'markov',
                 ]:  # categorical
                     value = data[key][i]
                     if pd.isna(value):
@@ -282,7 +311,7 @@ class PARModel(DeepEcho):
                 x[p_idx] = 0.0
                 x[missing_idx] = 1.0 if pd.isna(context[key]) else 0.0
 
-            elif props['type'] in ['categorical', 'ordinal']:
+            elif props['type'] in ['categorical', 'ordinal', 'markov']:
                 value = context[key]
                 if pd.isna(value):
                     value = None
@@ -436,7 +465,7 @@ class PARModel(DeepEcho):
                     log_likelihood += torch.sum(p_true * p_pred)
                     log_likelihood += torch.sum((1.0 - p_true) * torch.log(1.0 - torch.exp(p_pred)))
 
-            elif props['type'] in ['categorical', 'ordinal']:
+            elif props['type'] in ['categorical', 'ordinal', 'markov']:
                 idx = list(props['indices'].values())
                 log_softmax = torch.nn.functional.log_softmax(Y_padded[:, :, idx], dim=2)
 
@@ -480,7 +509,7 @@ class PARModel(DeepEcho):
                         sample = x[i, 0, r_idx].item() * props['range'] + props['min']
                         data[key].append(int(sample))
 
-                elif props['type'] in ['categorical', 'ordinal']:
+                elif props['type'] in ['categorical', 'ordinal', 'markov']:
                     ml_value, max_x = None, float('-inf')
                     for value, idx in props['indices'].items():
                         if x[i, 0, idx] > max_x:
@@ -494,7 +523,7 @@ class PARModel(DeepEcho):
 
         return data
 
-    def _sample_state(self, x):
+    def _sample_state(self, x, prev_x=None):
         log_likelihood = 0.0
         seq_len, batch_size, _input_size = x.shape
         assert seq_len == 1 and batch_size == 1
@@ -537,6 +566,20 @@ class PARModel(DeepEcho):
                 x[0, 0, idx] = x_new
                 log_likelihood += torch.sum(torch.log(p) * x_new)
 
+            elif props['type'] in ['markov']:
+                # Follow categorical, but add probability from transition matrix rather than p
+                idx = list(props['indices'].values())
+                p = torch.nn.functional.softmax(x[0, 0, idx], dim=0)
+                x_new = torch.zeros(p.size()).to(self.device)
+                x_new.scatter_(dim=0, index=torch.multinomial(p, 1), value=1)
+                x[0, 0, idx] = x_new
+
+                if prev_x is None or abs(prev_x[0, 0, idx].sum().item()) < 1e-9:
+                    log_likelihood += torch.sum(torch.log(p) * x_new) # update prob
+                else:
+                    transition_idx = torch.argmax(prev_x[0, 0, idx]).item()
+                    log_likelihood += torch.sum(torch.log(self.transition_matrices[key][transition_idx]) * x_new)
+
             else:
                 raise ValueError()
 
@@ -550,7 +593,7 @@ class PARModel(DeepEcho):
         x = x.unsqueeze(0).unsqueeze(0)
 
         for step in range(max_length):
-            next_x, ll = self._sample_state(self._model(x, context)[-1:, :, :])
+            next_x, ll = self._sample_state(self._model(x, context)[-1:, :, :], x[-1:, :, :])
             x = torch.cat([x, next_x], dim=0)
             log_likelihood += ll
             if next_x[0, 0, self._data_map['<TOKEN>']['indices']['<END>']] > 0.0:

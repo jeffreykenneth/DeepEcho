@@ -34,6 +34,7 @@ class DeepEcho:
             'ordinal',
             'count',
             'datetime',
+            'markov',
         ])
         assert all(dtype in dtypes for dtype in context_types)
         assert all(dtype in dtypes for dtype in data_types)
